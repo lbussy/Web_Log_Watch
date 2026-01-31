@@ -1,6 +1,6 @@
 # Web_Log_Watch
 
-Web_Log_Watch is a **PHP systemd-journald → JSON → Server‑Sent Events (SSE)** adapter
+Web_Log_Watch is a **PHP systemd‑journald → JSON → Server‑Sent Events (SSE)** adapter
 with a **ready‑to‑use web log viewer UI**.
 
 It is designed as a **drop‑in, self‑contained log streaming component** that can be
@@ -15,6 +15,7 @@ This repository contains:
 - Server‑side filtering (priority, unit)
 - Playback / backlog support
 - Heartbeats and internal diagnostic events
+- Hardened reconnect logic with UI connection status badge
 
 This README is the **authoritative end‑user documentation** for the project.
 
@@ -22,7 +23,7 @@ This README is the **authoritative end‑user documentation** for the project.
 
 ## Key Features
 
-- Stream **systemd-journald** logs in real time
+- Stream **systemd‑journald** logs in real time
 - JSON‑encoded events over **SSE (`text/event-stream`)**
 - Backlog replay (`journalctl -n`) on first connect
 - Cursor‑based resume without duplicates
@@ -33,6 +34,8 @@ This README is the **authoritative end‑user documentation** for the project.
 - Server‑side filtering:
   - Priority range
   - systemd unit(s)
+- Automatic reconnect with jittered backoff
+- Visual **connection status badge** (Connected / Reconnecting / Disconnected)
 - Fully working **web UI** included
 - No JavaScript frameworks required
 - Designed for **local or trusted environments**
@@ -43,7 +46,7 @@ This README is the **authoritative end‑user documentation** for the project.
 ## Repository Contents
 
 | File | Purpose |
-| ----- | -------- |
+| ----- | --------- |
 | `log_stream.php` | Journald → JSON → SSE adapter |
 | `view_logs.php` | Browser UI for viewing streamed logs |
 | `API_syslog.md` | Low‑level streaming API specification |
@@ -153,9 +156,45 @@ Every SSE `data:` message contains **one JSON object**.
 ### Event Types
 
 | Type | Meaning |
-| ---- | -------- |
+| ----- | --------- |
 | `journal` | Real journald entry |
 | `internal` | Adapter / heartbeat / diagnostic event |
+
+---
+
+## Time & Timestamp Handling
+
+- Transport uses `__REALTIME_TIMESTAMP` (microseconds since Unix epoch).
+- The included UI renders timestamps as **ISO‑8601 UTC strings**.
+- Precision is preserved in transport; formatting is consumer‑defined.
+
+Example rendered timestamp:
+
+```text
+2026-01-31T00:09:25.035Z
+```
+
+---
+
+## Severity, Labels, and Coloring
+
+- `PRIORITY` follows syslog semantics (`0..7`).
+- The UI maps priorities to labels:
+
+| Priority | Label |
+| --------- | ------- |
+| 0 | EMERG |
+| 1 | ALERT |
+| 2 | CRIT |
+| 3 | ERROR |
+| 4 | WARN |
+| 5 | NOTICE |
+| 6 | INFO |
+| 7 | DEBUG |
+
+- Severity coloring is **consumer‑side only**
+- Coloring is declarative and replay‑safe
+- Internal events may be styled differently or hidden
 
 ---
 
@@ -164,6 +203,7 @@ Every SSE `data:` message contains **one JSON object**.
 - Journald events include an SSE `id:` equal to the URL‑encoded `__CURSOR`
 - Browsers automatically resend this as `Last‑Event‑ID` on reconnect
 - Server resumes using `journalctl --after-cursor`
+- Backlog replay still occurs when enabled, scoped by cursor
 
 ### Consumer Rule (Important)
 
@@ -177,16 +217,37 @@ Internal events **must not** advance the cursor.
 
 ---
 
+## Reconnect Semantics
+
+- Browsers automatically reconnect on transient failures
+- When `EventSource.readyState === CLOSED`, auto‑reconnect has stopped
+- The UI initiates a **manual reconnect** with jittered exponential backoff
+- This avoids reconnect storms and ensures recovery from terminal errors
+
+---
+
+## Connection Status Badge (UI)
+
+The included UI displays a small badge in the top‑right of the log panel:
+
+| State | Meaning |
+| ------ | --------- |
+| Connected | SSE stream active |
+| Reconnecting | Manual reconnect scheduled |
+| Disconnected | Stream closed and retry pending |
+
+The badge is **informational only** and does not affect protocol behavior.
+
+---
+
 ## Query Parameters
 
 ### Playback & Backlog
 
 | Parameter | Default | Description |
-| --------- | -------- | ------------- |
+| --------- | --------- | ------------- |
 | `playback` | `1` | Enable replay/backlog |
 | `backlog` | `200` | Number of entries to replay |
-
-Replay is **skipped** if `Last-Event-ID` is present.
 
 ---
 
@@ -199,12 +260,6 @@ Mapped directly to `journalctl -p`.
 | `priority_min` | Lowest priority (0–7) |
 | `priority_max` | Highest priority (0–7) |
 
-Example:
-
-```text
-log_stream.php?priority_max=4
-```
-
 ---
 
 ### systemd Unit Filtering
@@ -214,27 +269,18 @@ log_stream.php?priority_max=4
 | `unit` | Comma‑separated unit list |
 | `unit=*` | Disable unit filtering |
 
-Examples:
-
-```text
-log_stream.php?unit=ssh.service
-log_stream.php?unit=ssh.service,cron.service
-log_stream.php?unit=*
-```
-
 ---
 
 ### Heartbeats
 
-Keeps idle connections alive.
-
 | Parameter | Default | Description |
-| --------- | -------- | ------------- |
+| --------- | --------- | ------------- |
 | `heartbeat` | `15` | Seconds between heartbeats |
 
 Heartbeat events:
 
 - `type: "internal"`
+- `PRIORITY: "7"`
 - `MESSAGE: "[HEARTBEAT]"`
 
 ---
@@ -244,15 +290,16 @@ Heartbeat events:
 The included UI provides:
 
 - Live log streaming
-- Severity‑based tabs
-- “All” view (journal only)
+- Severity‑based coloring and tabs
+- “All” view (journal entries only)
 - Priority range controls
 - Automatic resume
 - Visual separation of internal events
+- Connection status badge
 - Zero build step
-- Pure PHP + JS
+- Pure PHP + JavaScript
 
-It consumes **the same API** exposed for external use.
+It consumes **the same SSE API** exposed for external use.
 
 ---
 
@@ -262,7 +309,7 @@ It consumes **the same API** exposed for external use.
 2. Parse unified JSON events
 3. Render or store as desired
 4. Persist last journald cursor
-5. Allow browser SSE reconnects
+5. Allow automatic or manual reconnect
 6. Optionally control playback and filtering
 
 ---
@@ -280,7 +327,7 @@ It consumes **the same API** exposed for external use.
 
 MIT License.
 
-This project is UI‑agnostic, transport‑only by design.
+This project is UI‑agnostic and transport‑only by design.
 You are free to embed it into other systems and build custom UIs on top.
 
 ---
@@ -289,8 +336,8 @@ You are free to embed it into other systems and build custom UIs on top.
 
 See **`API_syslog.md`** for:
 
-- Complete schema
-- Resume semantics
+- Complete unified schema
+- Cursor‑resume semantics
+- Replay and reconnect guarantees
 - Internal event definitions
-- OpenAPI‑style reference
 - JavaScript consumer examples

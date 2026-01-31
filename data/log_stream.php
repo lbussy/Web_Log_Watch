@@ -591,14 +591,27 @@ emit_internal(
 // -----------------------------------------------------------------------------
 $cursorForFollow = null;
 
+// If the client provided a cursor (Last-Event-ID), we will resume the follow
+// loop from that point. If playback is enabled, we will still emit a small
+// backlog for context, but we will scope that replay to entries after the
+// provided cursor so we do not skip forward and miss unseen messages.
 if ($lastCursor !== null) {
     $cursorForFollow = $lastCursor;
-} elseif ($playbackEnabled && $initialBacklog > 0) {
+}
+
+if ($playbackEnabled && $initialBacklog > 0) {
     $replayParts = array_merge(
         [$journalctlPath, '--no-pager', '-o', 'json'],
-        $journalFilters,
-        ['-n', (string)$initialBacklog]
+        $journalFilters
     );
+
+    if ($lastCursor !== null) {
+        $replayParts[] = '--after-cursor';
+        $replayParts[] = $lastCursor;
+    }
+
+    $replayParts[] = '-n';
+    $replayParts[] = (string)$initialBacklog;
 
     emit_playback_event('playback_start', true);
     emit_internal('journalctl replay starting', '7', $internalUnit, true);
@@ -607,17 +620,21 @@ if ($lastCursor !== null) {
     $started = proc_start(build_cmd($replayParts));
     if ($started['ok']) {
         $res = drain_process($started, false, $internalUnit, $heartbeatSec, true);
-        $cursorForFollow = $res['lastCursor'] ?? null;
+        $cursorForFollow = $res['lastCursor'] ?? $cursorForFollow;
         emit_internal('journalctl replay complete', '7', $internalUnit, true);
         // Signal to the client that initial catch-up is finished.
         emit_playback_event('playback_end', false);
     } else {
-        emit_internal('journalctl replay failed: ' . (string)($started['stderr'] ?? ''), '3', $internalUnit, false);
+        emit_internal(
+            'journalctl replay failed: ' . (string)($started['stderr'] ?? ''),
+            '3',
+            $internalUnit,
+            false
+        );
         // Even on failure, end playback mode so the UI can switch to live follow.
         emit_playback_event('playback_end', false);
     }
 }
-
 // -----------------------------------------------------------------------------
 // Phase 2: Follow (always)
 // -----------------------------------------------------------------------------
