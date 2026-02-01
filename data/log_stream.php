@@ -311,15 +311,52 @@ function proc_start(string $cmd): array
 
     usleep(150000);
     $status = proc_get_status($proc);
+
+    // Replay (`journalctl ... -n N`) can legitimately exit immediately after
+    // emitting its output. Follow mode (`journalctl -f`) must remain running.
+    // Return handles even when the process has already exited so callers can
+    // drain stdout/stderr and close the process cleanly.
     if (!$status['running']) {
         $err = trim(stream_get_contents($pipes[2]));
         if ($err === '') {
             $err = 'process exited immediately';
         }
-        return ['ok' => false, 'stderr' => $err];
+        return [
+            'ok' => false,
+            'stderr' => $err,
+            'proc' => $proc,
+            'pipes' => $pipes,
+            'running' => false,
+            'exited_immediately' => true,
+            'exitcode' => $status['exitcode'] ?? null,
+        ];
     }
 
-    return ['ok' => true, 'proc' => $proc, 'pipes' => $pipes];
+    return [
+        'ok' => true,
+        'proc' => $proc,
+        'pipes' => $pipes,
+        'running' => true,
+        'exitcode' => $status['exitcode'] ?? null,
+    ];
+}
+
+
+function proc_cleanup(array $started): void
+{
+    $pipes = $started['pipes'] ?? null;
+    if (is_array($pipes)) {
+        foreach ($pipes as $p) {
+            if (is_resource($p)) {
+                fclose($p);
+            }
+        }
+    }
+
+    $proc = $started['proc'] ?? null;
+    if (is_resource($proc)) {
+        proc_close($proc);
+    }
 }
 
 function send_entry(array $entry, bool $isPlayback): ?string
@@ -534,9 +571,9 @@ function drain_process(
             fclose($p);
         }
     }
-    proc_close($proc);
+    $exitcode = proc_close($proc);
 
-    return ['lastCursor' => $lastCursor];
+    return ['lastCursor' => $lastCursor, 'exitcode' => $exitcode];
 }
 
 // Discover journalctl path.
@@ -618,10 +655,32 @@ if ($playbackEnabled && $initialBacklog > 0) {
     emit_internal('journalctl replay cmd: ' . build_cmd($replayParts), '7', $internalUnit, true);
 
     $started = proc_start(build_cmd($replayParts));
-    if ($started['ok']) {
+
+    // `journalctl -n N` (replay) often exits quickly after writing output.
+    // If it exited immediately, still drain stdout/stderr so the client
+    // receives the backlog.
+    if ($started['ok'] || !empty($started['exited_immediately'])) {
+        if (!$started['ok'] && !empty($started['exited_immediately'])) {
+            emit_internal('journalctl replay exited quickly; draining output', '7', $internalUnit, true);
+        }
+
         $res = drain_process($started, false, $internalUnit, $heartbeatSec, true);
         $cursorForFollow = $res['lastCursor'] ?? $cursorForFollow;
-        emit_internal('journalctl replay complete', '7', $internalUnit, true);
+
+        // Treat non-zero exit as a replay failure, but do not hide any drained
+        // output from the client.
+        if (!$started['ok'] && (($res['exitcode'] ?? 0) !== 0)) {
+            emit_internal(
+                'journalctl replay failed: exitcode=' . (string)($res['exitcode'] ?? '') . ' stderr='
+                    . (string)($started['stderr'] ?? ''),
+                '3',
+                $internalUnit,
+                false
+            );
+        } else {
+            emit_internal('journalctl replay complete', '7', $internalUnit, true);
+        }
+
         // Signal to the client that initial catch-up is finished.
         emit_playback_event('playback_end', false);
     } else {
@@ -631,6 +690,13 @@ if ($playbackEnabled && $initialBacklog > 0) {
             $internalUnit,
             false
         );
+
+        // Ensure we do not leak pipes/proc handles on start failures that still
+        // created a process.
+        if (isset($started['proc']) || isset($started['pipes'])) {
+            proc_cleanup($started);
+        }
+
         // Even on failure, end playback mode so the UI can switch to live follow.
         emit_playback_event('playback_end', false);
     }
@@ -656,6 +722,11 @@ while (true) {
     $started = proc_start(build_cmd($followParts));
     if (!$started['ok']) {
         emit_internal('journalctl follow failed: ' . (string)($started['stderr'] ?? ''), '3', $internalUnit, false);
+
+        if (isset($started['proc']) || isset($started['pipes'])) {
+            proc_cleanup($started);
+        }
+
         sleep(1);
         continue;
     }
